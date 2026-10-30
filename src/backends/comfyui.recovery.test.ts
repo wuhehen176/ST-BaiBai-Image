@@ -10,6 +10,88 @@ const image = () => new Response(new Blob(['jpeg-test'], { type: 'image/jpeg' })
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('ComfyUI 已提交任务恢复与串行取图', () => {
+  it('reserves reading order before a slow probe and POST acknowledgement, without waiting for generation', async () => {
+    const order: string[] = [];
+    let probes = 0;
+    let releaseProbe!: () => void, releaseAck!: () => void, releaseHistory!: () => void;
+    const probe = new Promise<void>(resolve => { releaseProbe = resolve; });
+    const ack = new Promise<void>(resolve => { releaseAck = resolve; });
+    const pendingHistory = new Promise<void>(resolve => { releaseHistory = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const u = String(input);
+      if (u.endsWith('/system_stats')) { if (++probes === 1) await probe; return json({}); }
+      if (u.endsWith('/prompt')) {
+        const text = JSON.parse(String(init?.body)).prompt['1'].inputs.text;
+        order.push(text);
+        if (text === 'first') await ack;
+        return json({ prompt_id: text });
+      }
+      if (u.includes('/history/')) { await pendingHistory; return history(u.split('/').pop()!); }
+      if (u.includes('/view?')) return image();
+      throw new Error(u);
+    }));
+    const first = generateComfyImage(conn, { prompt: 'first' });
+    const second = generateComfyImage(conn, { prompt: 'second' });
+    try {
+      await vi.waitFor(() => expect(probes).toBe(1));
+      expect(order).toEqual([]);
+      releaseProbe();
+      await vi.waitFor(() => expect(order).toEqual(['first']));
+      expect(probes).toBe(1);
+      releaseAck();
+      await vi.waitFor(() => expect(order).toEqual(['first', 'second']));
+      expect(probes).toBe(2); // Both submitted while the first generation is still unfinished.
+    } finally {
+      releaseProbe(); releaseAck(); releaseHistory();
+      (await Promise.all([first, second])).forEach(result => result.revoke());
+    }
+  });
+
+  it('cancelling a queued submission skips it without allowing later tasks to overtake the active probe', async () => {
+    let probes = 0;
+    const order: string[] = [];
+    let release!: () => void;
+    const probe = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const u = String(input);
+      if (u.endsWith('/system_stats')) { if (++probes === 1) await probe; return json({}); }
+      if (u.endsWith('/prompt')) { const text = JSON.parse(String(init?.body)).prompt['1'].inputs.text; order.push(text); return json({ prompt_id: text }); }
+      if (u.includes('/history/')) return history(u.split('/').pop()!);
+      if (u.includes('/view?')) return image();
+      throw new Error(u);
+    }));
+    const abort = new AbortController();
+    const first = generateComfyImage(conn, { prompt: 'first' });
+    const cancelled = expect(generateComfyImage(conn, { prompt: 'cancelled' }, abort.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    const third = generateComfyImage(conn, { prompt: 'third' });
+    try {
+      abort.abort(); await cancelled;
+      expect(probes).toBe(1); expect(order).toEqual([]);
+    } finally {
+      release(); (await Promise.all([first, third])).forEach(result => result.revoke());
+    }
+    expect(order).toEqual(['first', 'third']);
+  });
+
+  it('a failed submission releases FIFO order and is not duplicated', async () => {
+    const order: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const u = String(input);
+      if (u.endsWith('/prompt')) {
+        const text = JSON.parse(String(init?.body)).prompt['1'].inputs.text; order.push(text);
+        if (text === 'first') throw new TypeError('lost acknowledgement');
+        return json({ prompt_id: text });
+      }
+      if (u.includes('/history/')) return history(u.split('/').pop()!);
+      if (u.includes('/view?')) return image();
+      return json({});
+    }));
+    const first = expect(generateComfyImage(conn, { prompt: 'first' })).rejects.toThrow('lost acknowledgement');
+    const second = generateComfyImage(conn, { prompt: 'second' });
+    await first; (await second).revoke();
+    expect(order).toEqual(['first', 'second']);
+  });
+
   it('history transport/503 failures retry the same ID and never submit another prompt', async () => {
     vi.useFakeTimers();
     const paths: string[] = [];

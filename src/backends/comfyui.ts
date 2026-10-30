@@ -33,8 +33,10 @@ const SERVER_BASE = '/api/sd/comfy';
 const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const READ_RETRIES = 3;
+// Keep submission order separate from image transfers: don't wait for a rendered image to submit the next task.
+const submitSerial = serialQueue();
 // Native /generate hides its download phase, so reserve the transfer slot for that whole call.
-let transferTail: Promise<void> = Promise.resolve();
+const transferSerial = serialQueue();
 
 /**
  * 生成随机种子（0 ≤ seed < 2^53，与 Python random.randint(0, 2**53 - 1) 同范围）。
@@ -267,26 +269,29 @@ function fileFormat(filename: string, mime = ''): string {
   return mime.split('/').pop()?.toLowerCase() || 'png';
 }
 
-async function transferSerial<T>(signal: AbortSignal | undefined, task: () => Promise<T>): Promise<T> {
-  const previous = transferTail;
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  transferTail = previous.then(() => gate);
-  // Cancellation while waiting must not let the next transfer overtake the active one.
-  let onAbort: (() => void) | undefined;
-  try {
-    signal?.throwIfAborted();
-    await (signal ? new Promise<void>((resolve, reject) => {
-      onAbort = () => reject(signal.reason ?? new DOMException('已取消', 'AbortError'));
-      signal.addEventListener('abort', onAbort, { once: true });
-      previous.then(resolve, reject);
-    }) : previous);
-    signal?.throwIfAborted();
-    return await task();
-  } finally {
-    if (onAbort) signal?.removeEventListener('abort', onAbort);
-    release();
-  }
+function serialQueue() {
+  let tail: Promise<void> = Promise.resolve();
+  return async function<T>(signal: AbortSignal | undefined, task: () => Promise<T>): Promise<T> {
+    const previous = tail;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    tail = previous.then(() => gate);
+    // Cancellation while waiting must not let the next transfer overtake the active one.
+    let onAbort: (() => void) | undefined;
+    try {
+      signal?.throwIfAborted();
+      await (signal ? new Promise<void>((resolve, reject) => {
+        onAbort = () => reject(signal.reason ?? new DOMException('已取消', 'AbortError'));
+        signal.addEventListener('abort', onAbort, { once: true });
+        previous.then(resolve, reject);
+      }) : previous);
+      signal?.throwIfAborted();
+      return await task();
+    } finally {
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+      release();
+    }
+  };
 }
 
 function transientReadError(error: unknown): boolean {
@@ -572,16 +577,23 @@ export async function generateComfyImage(
     workflow = renderWorkflowTemplate(conn.workflow, { ...values, ...size });
   }
 
-  // Probe with a read-only request BEFORE submitting. A failed POST does not prove it was not accepted.
-  try {
-    const response = await fetch(endpoint(conn.url, 'system_stats'), { signal });
-    if (!response.ok) throw await responseError(response, '浏览器连接 ComfyUI 失败');
-  } catch (error) {
-    if (signal?.aborted || !isNetworkError(error)) throw error;
-    if (conn.imageFormat === 'jpeg') throw new ComfyUIError('JPG 轻量取图需要浏览器直连 ComfyUI；请启用 --enable-cors-header 后测试连接。未通过转发重新提交。');
-    try { return await generateViaServer(conn, workflow, signal); }
+  // Reserve FIFO order BEFORE the probe: later, faster probes must not overtake earlier cards.
+  const submitted = await submitSerial(signal, async () => {
+    // A failed POST does not prove it was not accepted; never include it in fallback handling.
+    try {
+      const response = await fetch(endpoint(conn.url, 'system_stats'), { signal });
+      if (!response.ok) throw await responseError(response, '浏览器连接 ComfyUI 失败');
+    } catch (error) {
+      if (signal?.aborted || !isNetworkError(error)) throw error;
+      if (conn.imageFormat === 'jpeg') throw new ComfyUIError('JPG 轻量取图需要浏览器直连 ComfyUI；请启用 --enable-cors-header 后测试连接。未通过转发重新提交。');
+      // Register native transfers in the same order, but don't hold the submission queue while they run.
+      return { server: generateViaServer(conn, workflow, signal) };
+    }
+    return { promptId: await queueDirect(conn, workflow, signal) };
+  });
+  if (submitted.server) {
+    try { return await submitted.server; }
     catch (serverError) { return recoverServerResult(conn, serverError, signal, hooks); }
   }
-  const promptId = await queueDirect(conn, workflow, signal);
-  return pollDirectResult(conn, promptId, signal, hooks);
+  return pollDirectResult(conn, submitted.promptId!, signal, hooks);
 }
