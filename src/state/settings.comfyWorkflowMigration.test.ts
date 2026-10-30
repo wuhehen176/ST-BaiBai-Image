@@ -29,6 +29,14 @@ async function hydrateWithComfy(comfyui: Record<string, unknown> | undefined) {
 }
 
 describe('ComfyUI 工作流库迁移', () => {
+  it('取图默认使用 JPG', async () => {
+    const jpeg = await hydrateWithComfy({});
+    expect(jpeg.comfyui.imageFormat).toBe('jpeg');
+  });
+  it('可显式选择原始格式', async () => {
+    const original = await hydrateWithComfy({ imageFormat: 'original' });
+    expect(original.comfyui.imageFormat).toBe('original');
+  });
   beforeEach(() => {
     vi.resetModules();
     vi.stubGlobal('toastr', { info: vi.fn(), success: vi.fn(), error: vi.fn() });
@@ -140,6 +148,7 @@ describe('ComfyUI 工作流库迁移', () => {
     const { simpleDefaults } = await import('@/backends/comfyTemplates');
     expect(effectiveComfyConn()).toEqual({
       url: 'http://example:8188',
+      imageFormat: 'jpeg',
       workflow: '{"2":{}}',
       // 存量预设没有 mode/simple 字段 → custom + 简易模式默认值
       mode: 'custom',

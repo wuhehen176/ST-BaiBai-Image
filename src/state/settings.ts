@@ -91,6 +91,8 @@ export interface ComfyWorkflowPreset extends SizePair {
  */
 export interface ComfyRunConn extends SizePair {
   url: string;
+  /** 浏览器取图格式；原始输出文件仍留在 ComfyUI。 */
+  imageFormat?: 'original' | 'jpeg';
   workflow: string;
   mode: ComfyPresetMode;
   simple: ComfySimpleConfig;
@@ -98,6 +100,7 @@ export interface ComfyRunConn extends SizePair {
 
 /** ComfyUI 连接与工作流库。 */
 export interface ComfyUISettings extends BackendConn {
+  imageFormat: 'original' | 'jpeg';
   /** 工作流库。**不变式:恒非空**(至少一条,见 normalizeComfyUI 收尾兜底)。 */
   workflows: ComfyWorkflowPreset[];
   /** 当前使用的工作流 id;指向已删条目时由 normalize 回落到第一条。 */
@@ -1108,6 +1111,7 @@ function comfyDefaults(): ComfyUISettings {
   const preset = newComfyWorkflow();
   return {
     ...backendDefaults('http://127.0.0.1:8188'),
+    imageFormat: 'jpeg',
     workflows: [preset],
     activeWorkflowId: preset.id,
   };
@@ -1307,6 +1311,7 @@ export function effectiveComfyConn(): ComfyRunConn {
   const preset = activeComfyPreset();
   return {
     url: settings.comfyui.url,
+    imageFormat: settings.comfyui.imageFormat,
     workflow: preset.workflow,
     mode: preset.mode,
     simple: preset.simple,
@@ -1448,7 +1453,7 @@ function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
       ? o.activeWorkflowId
       : workflows[0].id;
 
-  return { ...conn, workflows, activeWorkflowId };
+  return { ...conn, imageFormat: o.imageFormat === 'original' ? 'original' : 'jpeg', workflows, activeWorkflowId };
 }
 
 const NAI_MODEL_VALUES = new Set<string>(NAI_MODELS.map(m => m.value));

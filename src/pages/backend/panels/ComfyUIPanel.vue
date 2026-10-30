@@ -370,6 +370,15 @@ function applyAssist() {
           />
         </div>
 
+        <div class="api-row">
+          <span class="bbi-field-label">取图格式</span>
+          <select v-model="settings.comfyui.imageFormat" class="bbi-select" aria-label="ComfyUI 取图格式">
+            <option value="jpeg">JPG 轻量传输</option>
+            <option value="original">原始格式</option>
+          </select>
+        </div>
+        <p class="bbi-field-hint">JPG 保持原尺寸、质量 92，不携带 PNG 工作流信息；电脑原图保留。需要浏览器直连，ComfyUI 启动参数加入 --enable-cors-header。取图串行，短暂失败只重试读取原任务。</p>
+
         <div class="conn-actions">
           <span v-if="inUse" class="conn-inuse"><Icon name="check" :size="13" /> 当前出图渠道</span>
           <button
